@@ -1,4 +1,4 @@
-﻿import express from "express";
+import express from "express";
 import { DynamicEvmWalletClient } from "@dynamic-labs-wallet/node-evm";
 
 const app = express();
