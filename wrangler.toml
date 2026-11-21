@@ -1,0 +1,11 @@
+name = "telegram-crypto-worker"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+
+[[kv_namespaces]]
+binding = "PAYMENT_STATE"
+id = "2c2de765205e47df885d8972fe8af871"
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"

